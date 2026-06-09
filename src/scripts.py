@@ -1,116 +1,122 @@
-import aiohttp
 import asyncio
-import requests
 import os
-from PyQt6.QtCore import QObject, pyqtSignal
+from urllib.parse import urlparse
+
+import aiohttp
+from PySide6.QtCore import QObject, Signal
+
+_MAX_CONCURRENT_DOWNLOADS = 20
 
 
 class GetImage(QObject):
-    LIST_IMAGES = 100
-    progress_signal = pyqtSignal(int)
-    max_value = pyqtSignal(int)
-    error = pyqtSignal(str)
-    output_folder = 0
+    progress_signal = Signal(int)
+    max_value = Signal(int)
+    # Передаёт ключ из strings.STRINGS (например "err_token") и доп. аргумент
+    error = Signal(str, str)
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._token = None
-        self._channel_id = None
-        self.proxy_urls = []
-        self._output_folder = None
-    @property
-    def token(self):
-        return self._token
-    
-    @token.setter
-    def token(self, value):
-         self._token = value
-    @property
-    def channel_id(self):
-        return self._channel_id
+        self.token: str = ""
+        self.channel_id: str = ""
+        self.output_folder: str = ""
 
-    @channel_id.setter
-    def channel_id(self, value):
-        self._channel_id = value
+    async def _fetch_messages(self, session: aiohttp.ClientSession, url: str) -> list[dict] | None:
+        async with session.get(url, headers={"Authorization": self.token}) as response:
+            if response.status == 200:
+                return await response.json()
+            match response.status:
+                case 400 | 403 | 404:
+                    self.error.emit("err_channel", "")
+                case 401:
+                    self.error.emit("err_token", "")
+                case _:
+                    self.error.emit("err_http", str(response.status))
+            return None
 
-    def get_url_image(self):
-        url_base = f"https://discord.com/api/v9/channels/{
-            self.channel_id}/messages?limit=100"
-        response = requests.get(
-            url_base, headers={"Authorization": self.token})
-        print(response.status_code)
-        match response.status_code:
-            case 200:
-                user_data = response.json()
-                id = user_data[-1]["id"]
-                for item in user_data:
-                    if "attachments" in item and item["attachments"]:
-                        for attachment in item["attachments"]:
-                            if "proxy_url" in attachment:
-                                self.proxy_urls.append(attachment["proxy_url"])
-                return id
-            case 400:
-                self.handle_error("The channel field is incorrectly entered.")
-            case 401:
-                self.handle_error("Invalid Token.")
-            case _:
-                self.handle_error("Error: " + str(response.status_code))
+    @staticmethod
+    def _extract_attachments(messages: list[dict]) -> list[str]:
+        return [
+            proxy_url
+            for msg in messages
+            for attachment in msg.get("attachments", [])
+            if (proxy_url := attachment.get("proxy_url"))
+        ]
 
-    def get_irl_before(self, id=None) -> list:
+    async def _collect_image_urls(self, session: aiohttp.ClientSession) -> list[str] | None:
+        base = f"https://discord.com/api/v9/channels/{self.channel_id}/messages"
+        urls: list[str] = []
+
+        messages = await self._fetch_messages(session, f"{base}?limit=100")
+        if messages is None:
+            return None
+        if not messages:
+            return urls
+
+        urls.extend(self._extract_attachments(messages))
+        last_id: str = messages[-1]["id"]
+
+        # постранично собираем все сообщения канала
         while True:
-            url_base = f"https://discord.com/api/v9/channels/{
-                self.channel_id}/messages?before={id}&limit=100"
-            response = requests.get(
-                url_base, headers={"Authorization": self.token})
-            if response.status_code == 200:
-                user_data = response.json()
-                for item in user_data:
-                    if "attachments" in item and item["attachments"]:
-                        for attachment in item["attachments"]:
-                            if "proxy_url" in attachment:
-                                self.proxy_urls.append(attachment["proxy_url"])
+            messages = await self._fetch_messages(session, f"{base}?before={last_id}&limit=100")
+            if messages is None:
+                return None
+            if not messages:
+                break
+            urls.extend(self._extract_attachments(messages))
+            last_id = messages[-1]["id"]
+
+        return urls
+
+    async def _download_one(
+        self,
+        session: aiohttp.ClientSession,
+        sem: asyncio.Semaphore,
+        url: str,
+        idx: int,
+        folder: str,
+    ) -> bool:
+        _, ext = os.path.splitext(urlparse(url).path)
+        path = os.path.join(folder, f"image_{idx}{ext or '.jpg'}")
+        async with sem:
+            for _ in range(3):  # до 3 попыток на файл
                 try:
-                    id = user_data[-1]["id"]
-                except IndexError:
-                    break
-        print(len(self.proxy_urls))
-        self.max_value.emit(len(self.proxy_urls))
-        return self.proxy_urls
-
-    async def download_images(self, image_urls: list) -> None:
-        self.count = 0
-        if not self.output_folder:
-            self.output_folder = "image"
-        os.makedirs(self.output_folder, exist_ok=True)
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for idx, url in enumerate(image_urls):
-                task = self.download_image(session, url, idx)
-                tasks.append(task)
-            await asyncio.gather(*tasks)
-
-    async def download_image(self, session, url, idx):
-        for _ in range(3):
-            async with session.get(url) as response:
-
-                if response.status == 200:
-                    image_name = f"image_{idx}.jpg"
-                    image_path = os.path.join(self.output_folder, image_name)
-                    with open(image_path, "wb") as file:
-                        file.write(await response.content.read())
-                    self.count = self.count + 1
-                    self.progress_signal.emit(self.count)
-                    return
-                else:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            try:
+                                with open(path, "wb") as f:
+                                    # Stream the response in chunks to avoid incomplete payload issues
+                                    async for chunk in response.content.iter_chunked(65536):
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                            except (aiohttp.client_exceptions.ClientPayloadError, aiohttp.http_exceptions.ContentLengthError, asyncio.IncompleteReadError, ConnectionResetError):
+                                # transient download error, retry
+                                await asyncio.sleep(1)
+                                continue
+                            return True
+                except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError):
+                    # network-level error, retry
                     await asyncio.sleep(1)
+                    continue
+        return False
 
-    def start(self):
-        asyncio.run(self.download_images(
-            self.get_irl_before(self.get_url_image())))
+    async def _run(self) -> None:
+        async with aiohttp.ClientSession() as session:
+            urls = await self._collect_image_urls(session)
+            if not urls:
+                return
+            folder = self.output_folder or "images"
+            os.makedirs(folder, exist_ok=True)
+            self.max_value.emit(len(urls))
+            sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+            count = 0
+            for coro in asyncio.as_completed([
+                self._download_one(session, sem, url, idx, folder)
+                for idx, url in enumerate(urls)
+            ]):
+                if await coro:
+                    count += 1
+                    self.progress_signal.emit(count)
 
-    def handle_error(self, message):
-        self.error.emit(message)
-        print(message)
-
-
-
+    def start(self) -> None:
+        asyncio.run(self._run())
