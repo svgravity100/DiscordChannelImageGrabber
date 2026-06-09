@@ -1,0 +1,5 @@
+pytest
+pytest-qt
+pytest-asyncio
+python-dotenv
+PySide6
