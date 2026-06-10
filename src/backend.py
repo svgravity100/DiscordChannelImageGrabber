@@ -78,12 +78,12 @@ class Backend(QObject):
     progressChanged    = Signal()
     folderChanged      = Signal()
     themeChanged       = Signal()
-    closeRequested     = Signal()  # QML вызывает Qt.quit()
+    closeRequested     = Signal()  
     hideWindow         = Signal()
     showWindow         = Signal()
     errorMessage       = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, icon: QIcon | None = None) -> None:
         super().__init__()
         self._downloading: bool = False
         self._progress: int = 0
@@ -91,6 +91,7 @@ class Backend(QObject):
         self._folder: str = ""
         self._had_error: bool = False
         self._pending_token: str = ""
+        self._app_icon: QIcon = icon if (icon and not icon.isNull()) else QIcon()
         self._settings = QSettings("DiscordImageGrabber", "App")
         self._saved_token: str = self._settings.value("token", "").strip()
         self._lang: str = self._load_lang()
@@ -299,6 +300,9 @@ class Backend(QObject):
     # ── системный трей ────────────────────────────────────────────────────────
 
     def _make_tray_icon(self) -> QIcon:
+        if not self._app_icon.isNull():
+            return self._app_icon
+        
         pixmap = QPixmap(32, 32)
         pixmap.fill(QColor(0, 0, 0, 0))
         p = QPainter(pixmap)

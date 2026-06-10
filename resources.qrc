@@ -2,5 +2,6 @@
 <RCC version="1.0">
     <qresource prefix="/">
         <file alias="qml/main.qml">src/qml/main.qml</file>
+        <file alias="favicon.ico">src/favicon.ico</file>
     </qresource>
 </RCC>
